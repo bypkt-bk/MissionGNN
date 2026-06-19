@@ -1,30 +1,46 @@
 from __future__ import annotations
 
-import glob
-from dataclasses import dataclass
+import os
+import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
-import cv2
-import imagebind
-import numpy as np
 import torch
+import torch.nn as nn
+import torchvision.transforms.functional as F
 import tqdm
-from sklearn.model_selection import train_test_split
-from torchvision.io import read_video
 
+# ---- FIX pytorchvideo bug (must run before pytorchvideo imports) ----
+sys.modules["torchvision.transforms.functional_tensor"] = F
+
+from pytorchvideo.data.encoded_video import EncodedVideo
+from pytorchvideo.transforms import (
+    ApplyTransformToKey,
+    ShortSideScale,
+    UniformTemporalSubsample,
+)
+from pytorchvideo.models.hub import slowfast_r50
+from torchvision.transforms import Compose, Lambda
+from torchvision.transforms._transforms_video import CenterCropVideo, NormalizeVideo
+from imagebind.models import imagebind_model
 from imagebind.models.imagebind_model import ModalityType
+
+# ---- Feature dims ----
+SLOWFAST_DIM = 2304
+IMAGEBIND_DIM = 1024
+FUSED_DIM = SLOWFAST_DIM + IMAGEBIND_DIM  # 3328
 
 
 @dataclass(frozen=True)
 class Config:
-    video_root: Path = Path("./UCFCrimeDataset/Anomaly-Videos")
-    image_root: Path = Path("./Anomaly-Images")
+    video_root: Path = Path("sample")
     embedding_root: Path = Path("./UCFCrimeDataset/Embeddings")
     crime_classes: tuple[str, ...] = ("Abuse", "Arrest", "Arson", "Assault", "RoadAccidents", "Burglary", "Explosion", 
-              "Fighting", "Robbery", "Shooting", "Stealing", "Shoplifting", "Vandalism")
-    batch_size: int = 10
-    train_split: float = 0.8
-    random_state: int = 42
+              "Fighting", "Robbery", "Shooting", "Stealing", "Shoplifting", "Vandalism",)
+    video_extensions: tuple[str, ...] = (".mp4", ".avi", ".mkv")
+    clip_duration: float = 2.0
+    stride: float = 1.0
+    min_fps: float = 16.0
     device: str = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
@@ -32,198 +48,219 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def extract_frames_for_video(video_path: Path, output_dir: Path) -> None:
-    ensure_dir(output_dir)
+def get_slowfast_transform(num_frames: int = 32) -> ApplyTransformToKey:
+    class PackPath(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.alpha = 4
 
-    frames, _, _ = read_video(str(video_path), output_format="TCHW")
+        def forward(self, frames: torch.Tensor) -> list[torch.Tensor]:
+            fast = frames
+            slow = torch.index_select(
+                frames,
+                1,
+                torch.linspace(
+                    0, frames.shape[1] - 1, frames.shape[1] // self.alpha
+                ).long(),
+            )
+            return [slow, fast]
 
-    for frame_idx in range(frames.shape[0]):
-        frame_path = output_dir / f"{frame_idx:09d}.png"
-
-        # Uncomment to skip existing frames
-        # if frame_path.exists():
-        #     continue
-
-        frame = frames[frame_idx].permute(1, 2, 0).numpy()
-        cv2.imwrite(str(frame_path), frame[:, :, ::-1])
-
-
-def extract_all_frames(config: Config) -> None:
-    for crime_class in tqdm.tqdm(config.crime_classes, desc="Classes"):
-        class_video_dir = config.video_root / crime_class
-        class_image_dir = config.image_root / crime_class
-
-        if not class_video_dir.exists():
-            print(f"Skipping missing directory: {class_video_dir}")
-            continue
-
-        video_files = sorted(
-            [p for p in class_video_dir.iterdir() if p.is_file()]
-        )
-
-        for video_path in tqdm.tqdm(video_files, desc=crime_class, leave=False):
-            scene_name = video_path.stem
-            output_dir = class_image_dir / scene_name
-            print(f"Extracting: {video_path}")
-            extract_frames_for_video(video_path, output_dir)
-
-
-def load_imagebind_model(device: str) -> torch.nn.Module:
-    model = imagebind.models.imagebind_model.imagebind_huge(pretrained=True)
-    model.eval()
-    model.to(device)
-    return model
-
-
-def list_scene_dirs(image_root: Path) -> list[Path]:
-    return sorted(
-        Path(p) for p in glob.glob(str(image_root / "*" / "*")) if Path(p).is_dir()
+    return ApplyTransformToKey(
+        key="video",
+        transform=Compose(
+            [
+                UniformTemporalSubsample(num_frames),
+                Lambda(lambda x: x / 255.0),
+                NormalizeVideo([0.45] * 3, [0.225] * 3),
+                ShortSideScale(256),
+                CenterCropVideo(256),
+                PackPath(),
+            ]
+        ),
     )
 
 
-def scene_label(scene_path: Path) -> str:
-    return scene_path.parent.name
-
-
-def summarize_split(train_scenes: list[Path], valid_scenes: list[Path]) -> None:
-    classes = sorted({scene_label(path) for path in train_scenes + valid_scenes})
-    class_to_idx = {cls_name: idx for idx, cls_name in enumerate(classes)}
-
-    counts = np.zeros((2, len(classes)), dtype=int)
-
-    for split_idx, split_scenes in enumerate((train_scenes, valid_scenes)):
-        for path in split_scenes:
-            counts[split_idx, class_to_idx[scene_label(path)]] += 1
-
-    percentages = counts / counts.sum(axis=1, keepdims=True) * 100
-
-    print("Classes:", classes)
-    print("Counts:\n", counts)
-    print("Percentages:\n", percentages)
-    print(f"Train scenes: {len(train_scenes)}")
-    print(f"Valid scenes: {len(valid_scenes)}")
-
-
-def build_embedding_output_path(
-    embedding_split_dir: Path,
-    scene_name: str,
-    frame_stem: str,
-) -> Path:
-    return embedding_split_dir / f"{scene_name}_{frame_stem}.pt"
-
-
-def get_missing_batch_items(
-    image_paths: list[Path],
-    embedding_split_dir: Path,
-) -> tuple[bool, list[str], list[str]]:
-    scene_names = [img_path.parent.name for img_path in image_paths]
-    frame_stems = [img_path.stem for img_path in image_paths]
-
-    missing = any(
-        not build_embedding_output_path(embedding_split_dir, scene_name, frame_stem).exists()
-        for scene_name, frame_stem in zip(scene_names, frame_stems)
+def get_imagebind_transform() -> Compose:
+    return Compose(
+        [
+            UniformTemporalSubsample(3),
+            Lambda(lambda x: x / 255.0),
+            NormalizeVideo(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711],
+            ),
+            ShortSideScale(224),
+            CenterCropVideo(224),
+        ]
     )
 
-    return missing, scene_names, frame_stems
+
+class FusionModel(nn.Module):
+    """SlowFast + ImageBind dual-backbone fusion with learnable per-modality scaling."""
+
+    def __init__(self, device: str = "cuda") -> None:
+        super().__init__()
+        self.device = torch.device(device)
+
+        self.slowfast = slowfast_r50(pretrained=True)
+        self.slowfast.blocks[-1] = nn.Identity()
+        self.slowfast.to(self.device).eval()
+
+        self.imagebind = imagebind_model.imagebind_huge(pretrained=True)
+        self.imagebind.to(self.device).eval()
+
+        # Learnable sigmoid-bounded scale per modality, range (0, 2)
+        self.sf_scale = nn.Parameter(torch.tensor(0.0))
+        self.ib_scale = nn.Parameter(torch.tensor(0.0))
+
+        self.to(self.device)
+
+    def forward(
+        self, sf_input: list[torch.Tensor], ib_input: torch.Tensor
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            sf_feat = self.slowfast(sf_input)
+            if sf_feat.dim() == 5:
+                sf_feat = sf_feat.mean(dim=[2, 3, 4])
+            sf_feat = nn.functional.normalize(sf_feat, dim=1)
+
+            ib_feat = self.imagebind({ModalityType.VISION: ib_input})[
+                ModalityType.VISION
+            ]
+            ib_feat = nn.functional.normalize(ib_feat, dim=1)
+
+        sf_scale = torch.sigmoid(self.sf_scale) * 2
+        ib_scale = torch.sigmoid(self.ib_scale) * 2
+
+        sf_feat = sf_scale * sf_feat
+        ib_feat = ib_scale * ib_feat
+
+        fused = torch.cat([sf_feat, ib_feat], dim=1)
+        fused = nn.functional.normalize(fused, dim=1)
+        return fused
 
 
-def save_embeddings(
-    embeddings: torch.Tensor,
-    scene_names: list[str],
-    frame_stems: list[str],
-    embedding_split_dir: Path,
+def validate_video(
+    video: EncodedVideo, clip_duration: float, min_fps: float
+) -> tuple[bool, float]:
+    try:
+        clip = video.get_clip(0, min(clip_duration, float(video.duration)))
+        frames = clip.get("video")
+        if frames is None:
+            return False, 0.0
+        fps = frames.shape[1] / clip_duration
+        return fps >= min_fps, fps
+    except Exception:
+        return False, 0.0
+
+
+def build_output_path(embedding_class_dir: Path, video_path: Path) -> Path:
+    return embedding_class_dir / f"{video_path.stem}.pt"
+
+
+def embed_video(
+    model: FusionModel,
+    sf_tf: ApplyTransformToKey,
+    ib_tf: Compose,
+    video_path: Path,
+    output_path: Path,
+    config: Config,
 ) -> None:
-    ensure_dir(embedding_split_dir)
+    video = EncodedVideo.from_path(str(video_path), decode_audio=False)
 
-    for scene_name, frame_stem, embedding in zip(scene_names, frame_stems, embeddings):
-        output_path = build_embedding_output_path(
-            embedding_split_dir=embedding_split_dir,
-            scene_name=scene_name,
-            frame_stem=frame_stem,
-        )
-        torch.save(embedding, output_path)
-
-
-def embed_scene_frames(
-    model: torch.nn.Module,
-    scene_path: Path,
-    device: str,
-    batch_size: int,
-    embedding_split_dir: Path,
-) -> None:
-    image_paths = sorted(scene_path.glob("*.png"))
-    if not image_paths:
+    ok, fps = validate_video(video, config.clip_duration, config.min_fps)
+    if not ok:
+        print(f"Skipping (low fps or unreadable): {video_path}")
         return
 
-    for start_idx in tqdm.tqdm(
-        range(0, len(image_paths), batch_size),
-        desc=f"Embedding {scene_path.name}",
-        leave=False,
-    ):
-        batch_paths = image_paths[start_idx : start_idx + batch_size]
+    current = 0.0
+    feats: list[torch.Tensor] = []
+    times: list[float] = []
 
-        missing, scene_names, frame_stems = get_missing_batch_items(
-            image_paths=batch_paths,
-            embedding_split_dir=embedding_split_dir,
-        )
-        if not missing:
+    while current < video.duration - config.clip_duration:
+        clip = video.get_clip(current, current + config.clip_duration)
+
+        if clip.get("video") is None:
+            current += config.stride
             continue
 
-        inputs = {
-            ModalityType.VISION: imagebind.data.load_and_transform_vision_data(
-                [str(path) for path in batch_paths],
-                device,
-            )
-        }
+        sf = sf_tf(clip.copy())["video"]
+        sf = [x.unsqueeze(0).to(config.device) for x in sf]
+
+        ib = clip["video"].float()
+        ib = ib_tf(ib).unsqueeze(0).to(config.device)
 
         with torch.no_grad():
-            embeddings = model(inputs)[ModalityType.VISION].cpu()
+            feat = model(sf, ib)
 
-        save_embeddings(
-            embeddings=embeddings,
-            scene_names=scene_names,
-            frame_stems=frame_stems,
-            embedding_split_dir=embedding_split_dir,
-        )
+        feats.append(feat.cpu())
+        times.append(current + config.clip_duration / 2)
 
+        current += config.stride
 
-def generate_train_embeddings(config: Config) -> None:
-    scenes = list_scene_dirs(config.image_root)
-    if not scenes:
-        print(f"No scene directories found under: {config.image_root}")
+    if not feats:
+        print(f"No valid clips extracted: {video_path}")
         return
 
-    train_scenes, valid_scenes = train_test_split(
-        scenes,
-        test_size=1.0 - config.train_split,
-        random_state=config.random_state,
+    tensor = torch.vstack(feats)
+    tensor = nn.functional.normalize(tensor, dim=1)  # per-video normalization
+
+    torch.save(
+        {
+            "features": tensor,
+            "timestamps": times,
+            "fps": fps,
+            "clip_duration": config.clip_duration,
+            "stride": config.stride,
+        },
+        output_path,
     )
 
-    summarize_split(train_scenes, valid_scenes)
 
-    model = load_imagebind_model(config.device)
-    train_embedding_dir = config.embedding_root / "Train"
-    ensure_dir(train_embedding_dir)
+def list_class_videos(
+    class_video_dir: Path, video_extensions: tuple[str, ...]
+) -> list[Path]:
+    if not class_video_dir.exists():
+        return []
+    return sorted(
+        p
+        for p in class_video_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in video_extensions
+    )
 
-    for scene_path in tqdm.tqdm(train_scenes, desc="Train scenes"):
-        print(f"Processing scene: {scene_path}")
-        embed_scene_frames(
-            model=model,
-            scene_path=scene_path,
-            device=config.device,
-            batch_size=config.batch_size,
-            embedding_split_dir=train_embedding_dir,
-        )
+
+def generate_embeddings(config: Config) -> None:
+    ensure_dir(config.embedding_root)
+
+    model = FusionModel(device=config.device).eval()
+    sf_tf = get_slowfast_transform()
+    ib_tf = get_imagebind_transform()
+
+    for crime_class in tqdm.tqdm(config.crime_classes, desc="Classes"):
+        class_video_dir = config.video_root / crime_class
+        video_files = list_class_videos(class_video_dir, config.video_extensions)
+
+        if not video_files:
+            print(f"Skipping missing or empty directory: {class_video_dir}")
+            continue
+
+        embedding_class_dir = config.embedding_root / crime_class
+        ensure_dir(embedding_class_dir)
+
+        for video_path in tqdm.tqdm(video_files, desc=crime_class, leave=False):
+            output_path = build_output_path(embedding_class_dir, video_path)
+            if output_path.exists():
+                continue
+
+            try:
+                embed_video(model, sf_tf, ib_tf, video_path, output_path, config)
+            except Exception as e:
+                print(f"Failed: {video_path}: {e}")
 
 
 def main() -> None:
     config = Config()
-
-    # Step 1: Extract frames from videos
-    extract_all_frames(config)
-
-    # Step 2: Generate ImageBind embeddings for training scenes
-    generate_train_embeddings(config)
+    generate_embeddings(config)
 
 
 if __name__ == "__main__":

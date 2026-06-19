@@ -5,17 +5,21 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import k_hop_subgraph
 
 class GCNConvTarget(MessagePassing):
-    def __init__(self, in_channels: int, out_channels: int, k_hops: int):
+    def __init__(self, in_channels, out_channels, k_hops, edge_index, num_nodes):
         super().__init__(aggr="mean")
         self.k = k_hops
         self.lin = nn.Linear(in_channels, out_channels)
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        sensor_idx = x.size(1) - 2  # second last is sensor, last is encoding\
-        _, sub_edge_index, _, _ = k_hop_subgraph(sensor_idx, self.k, edge_index,
-                                                 relabel_nodes=False, directed=True, flow='target_to_source')
-        x = self.lin(x)
-        return self.propagate(sub_edge_index, x=x)
+        sensor_idx = num_nodes - 2
+        _, sub_edge_index, _, _ = k_hop_subgraph(
+            sensor_idx, k_hops, edge_index,
+            relabel_nodes=False, directed=True, flow='target_to_source'
+        )
+        self.register_buffer("sub_edge_index", sub_edge_index)
 
-    def message(self, x_i: torch.Tensor, x_j: torch.Tensor) -> torch.Tensor:
-        return x_i * x_j
+    def forward(self, x, edge_index=None):
+        x = self.lin(x)
+        return self.propagate(self.sub_edge_index, x=x)
+
+    def message(self, x_i, x_j):
+        return x_j
