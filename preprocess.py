@@ -33,7 +33,7 @@ FUSED_DIM = SLOWFAST_DIM + IMAGEBIND_DIM  # 3328
 
 @dataclass(frozen=True)
 class Config:
-    video_root: Path = Path("sample")
+    video_root: Path = Path("./UCFCrimeDataset/Anomaly-Videos")
     embedding_root: Path = Path("./UCFCrimeDataset/Embeddings")
     crime_classes: tuple[str, ...] = ("Abuse", "Arrest", "Arson", "Assault", "RoadAccidents", "Burglary", "Explosion", 
               "Fighting", "Robbery", "Shooting", "Stealing", "Shoplifting", "Vandalism",)

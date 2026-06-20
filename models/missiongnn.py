@@ -2,7 +2,8 @@ import torch
 from torch import nn
 from typing import List
 from config import cfg
-from graph.kg_loader import load_class_graph
+# from graph.kg_loader import load_class_graph
+from tools.tools import load_cached_class_graph
 from models.gcn import KnowledgeGCN
 from models.temporal import ShortTermTemporal
 
@@ -12,7 +13,7 @@ class MissionGNN(nn.Module):
         # build one KG‑specific branch per anomaly class
         branches: List[KnowledgeGCN] = []
         for cls in cfg.classes:
-            v, e = load_class_graph(cls)
+            v, e = load_cached_class_graph(cls)
             branches.append(KnowledgeGCN(v.to(cfg.device), e.to(cfg.device)))
         self.branches = nn.ModuleList(branches)
         self.temporal = ShortTermTemporal(sequence_length)
